@@ -27,3 +27,13 @@
 *.i*86
 *.x86_64
 *.hex
+
+#.svn是google code　上的配置文件
+.svn/
+
+#运行文件
+compute-accuracy
+word-analogy
+word2phrase
+word2vec
+distance
