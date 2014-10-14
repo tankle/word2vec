@@ -37,13 +37,19 @@ struct vocab_word {
 char train_file[MAX_STRING], output_file[MAX_STRING];//训练文件和输出文件
 char save_vocab_file[MAX_STRING], read_vocab_file[MAX_STRING];//保存词汇表和读取词汇表的文件。格式：词　词频
 struct vocab_word *vocab;//词动态数组
-//binary进行二进制文件读取写入，cbow为连续BAG OF WORDS结构，window为窗口大小 min_count为词频下限，小于该下限忽略；
+//binary进行二进制文件读取写入，cbow为连续BAG OF WORDS结构，
+//window为窗口大小 
+//min_count为词频下限，小于该下限忽略；
 //num_threads为线程数（多线程时每个线程负责部分训练文件，即将整个训练文件均分给多个线程，
 //多个线程更新所有的参数（更新参数时的读取冲突可以忽略），其他参数等所有线程共享），
 //min_reduce对词语进行约减
 int binary = 0, cbow = 1, debug_mode = 2, window = 5, min_count = 5, num_threads = 12, min_reduce = 1;
 int *vocab_hash;//词的hash表
 long long vocab_max_size = 1000, vocab_size = 0, layer1_size = 100;
+// train_words 训练的单词总数（词频累加）
+// word_count_actual 已经训练完的word个数
+// file_size 训练文件大小，ftell得到
+// classes 输出word clusters的类别数
 long long train_words = 0, word_count_actual = 0, iter = 5, file_size = 0, classes = 0;
 real alpha = 0.025, starting_alpha, sample = 1e-3;
 
@@ -53,16 +59,20 @@ real alpha = 0.025, starting_alpha, sample = 1e-3;
 real *syn0, *syn1, *syn1neg, *expTable;
 
 clock_t start;
-//hs表示hierarchical softmax，即层次化softmax替代原来的softmax来减少计算时间，加速训练，默认采用；
-//negative为negative sampling，默认不采用
+//hs表示hierarchical softmax，即层次化softmax替代原来的softmax来减少计算时间，加速训练，默认不采用；
+//negative为negative sampling，默认采用
 int hs = 0, negative = 5;
 const int table_size = 1e8;
-//sampling时 的分布table，按次序递减顺序
+
+//negative sampling时 的分布table
 int *table;
+
 
 //为negative sampling而建的word按词频的分布，以后生成随机数，从table中抽取到word作为negative samplings
 //如当前有3 words，词频为 word 0:10，word 1: 5， word 2:5，则将table可以分成4分，table[0] = 0, table[1]=0, table[2]=1, table[3]=2，
 //此时table中word分布满足其词频分布，后续用于抽样；在下面的实现中采用词频的幂作为其分布
+//可见参考此博文http://blog.csdn.net/itplus/article/details/37998797
+//
 void InitUnigramTable() {
   int a, i;
   long long train_words_pow = 0;
@@ -82,6 +92,7 @@ void InitUnigramTable() {
 }
 
 // Reads a single word from a file, assuming space + tab + EOL to be word boundaries
+//读取一个单词，假设每个单词以空格或者tab或者换行符为结尾
 void ReadWord(char *word, FILE *fin) {
   int a = 0, ch;
   while (!feof(fin)) {
@@ -105,6 +116,7 @@ void ReadWord(char *word, FILE *fin) {
 }
 
 // Returns hash value of a word
+//单词的hash值
 int GetWordHash(char *word) {
   unsigned long long a, hash = 0;
   for (a = 0; a < strlen(word); a++) hash = hash * 257 + word[a];
@@ -113,6 +125,7 @@ int GetWordHash(char *word) {
 }
 
 // Returns position of a word in the vocabulary; if the word is not found, returns -1
+//返回word 在词汇hash表中的的位置
 int SearchVocab(char *word) {
   unsigned int hash = GetWordHash(word);
   while (1) {
@@ -124,6 +137,7 @@ int SearchVocab(char *word) {
 }
 
 // Reads a word and returns its index in the vocabulary
+//从文件中读取一个单词并返回它在词汇hash表中的下标
 int ReadWordIndex(FILE *fin) {
   char word[MAX_STRING];
   ReadWord(word, fin);
@@ -132,6 +146,7 @@ int ReadWordIndex(FILE *fin) {
 }
 
 // Adds a word to the vocabulary
+//向词汇表中添加一个单词
 int AddWordToVocab(char *word) {
   unsigned int hash, length = strlen(word) + 1;
   if (length > MAX_STRING) length = MAX_STRING;
@@ -139,7 +154,7 @@ int AddWordToVocab(char *word) {
   strcpy(vocab[vocab_size].word, word);
   vocab[vocab_size].cn = 0;
   vocab_size++;
-  // Reallocate memory if needed
+  // Reallocate memory if needed 
   if (vocab_size + 2 >= vocab_max_size) {
     vocab_max_size += 1000;
     vocab = (struct vocab_word *)realloc(vocab, vocab_max_size * sizeof(struct vocab_word));
@@ -151,19 +166,25 @@ int AddWordToVocab(char *word) {
 }
 
 // Used later for sorting by word counts
+//比较两个单词的出现频率
 int VocabCompare(const void *a, const void *b) {
     return ((struct vocab_word *)b)->cn - ((struct vocab_word *)a)->cn;
 }
 
 // Sorts the vocabulary by frequency using word counts
+//对词汇表进行排序，利用单词出现的频率
+//并去掉低频词
 void SortVocab() {
   int a, size;
   unsigned int hash;
   // Sort the vocabulary and keep </s> at the first position
+  //</s> 是一个特殊的字符
   qsort(&vocab[1], vocab_size - 1, sizeof(struct vocab_word), VocabCompare);
+  //对重排之后的词汇hash表进行更新
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   size = vocab_size;
   train_words = 0;
+  //去掉低频词
   for (a = 0; a < size; a++) {
     // Words occuring less than min_count times will be discarded from the vocab
     if ((vocab[a].cn < min_count) && (a != 0)) {
@@ -186,14 +207,16 @@ void SortVocab() {
 }
 
 // Reduces the vocabulary by removing infrequent tokens
+//
 void ReduceVocab() {
   int a, b = 0;
   unsigned int hash;
-  for (a = 0; a < vocab_size; a++) if (vocab[a].cn > min_reduce) {
-    vocab[b].cn = vocab[a].cn;
-    vocab[b].word = vocab[a].word;
-    b++;
-  } else free(vocab[a].word);
+  for (a = 0; a < vocab_size; a++) 
+    if (vocab[a].cn > min_reduce) {
+      vocab[b].cn = vocab[a].cn;
+      vocab[b].word = vocab[a].word;
+      b++;
+    } else free(vocab[a].word);
   vocab_size = b;
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
   for (a = 0; a < vocab_size; a++) {
@@ -202,12 +225,14 @@ void ReduceVocab() {
     while (vocab_hash[hash] != -1) hash = (hash + 1) % vocab_hash_size;
     vocab_hash[hash] = a;
   }
+  //清空输出缓冲区
   fflush(stdout);
   min_reduce++;
 }
 
 // Create binary Huffman tree using the word counts
 // Frequent words will have short uniqe binary codes
+//创建Huffman二叉树
 void CreateBinaryTree() {
   long long a, b, i, min1i, min2i, pos1, pos2, point[MAX_CODE_LENGTH];
   char code[MAX_CODE_LENGTH];
@@ -276,6 +301,7 @@ void CreateBinaryTree() {
   free(parent_node);
 }
 
+//从训练文件中得到词汇频率表
 void LearnVocabFromTrainFile() {
   char word[MAX_STRING];
   FILE *fin;
@@ -286,6 +312,7 @@ void LearnVocabFromTrainFile() {
     printf("ERROR: training data file not found!\n");
     exit(1);
   }
+  //第一个为特殊词汇
   vocab_size = 0;
   AddWordToVocab((char *)"</s>");
   while (1) {
@@ -301,6 +328,7 @@ void LearnVocabFromTrainFile() {
       a = AddWordToVocab(word);
       vocab[a].cn = 1;
     } else vocab[i].cn++;
+    //如果词汇量太大，需要对低频词汇进行约减
     if (vocab_size > vocab_hash_size * 0.7) ReduceVocab();
   }
   SortVocab();
@@ -312,6 +340,7 @@ void LearnVocabFromTrainFile() {
   fclose(fin);
 }
 
+//保存词汇频率表
 void SaveVocab() {
   long long i;
   FILE *fo = fopen(save_vocab_file, "wb");
@@ -319,6 +348,7 @@ void SaveVocab() {
   fclose(fo);
 }
 
+//读取词汇表
 void ReadVocab() {
   long long a, i = 0;
   char c;
@@ -328,7 +358,9 @@ void ReadVocab() {
     printf("Vocabulary file not found\n");
     exit(1);
   }
+  //初始化词汇hash表
   for (a = 0; a < vocab_hash_size; a++) vocab_hash[a] = -1;
+
   vocab_size = 0;
   while (1) {
     ReadWord(word, fin);
@@ -359,6 +391,7 @@ void InitNet() {
   //posix_memalign是用来对齐函数
   a = posix_memalign((void **)&syn0, 128, (long long)vocab_size * layer1_size * sizeof(real));
   if (syn0 == NULL) {printf("Memory allocation failed\n"); exit(1);}
+  //Hierarchical Softmax 模型
   if (hs) {
     a = posix_memalign((void **)&syn1, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1 == NULL) {printf("Memory allocation failed\n"); exit(1);}
@@ -366,15 +399,15 @@ void InitNet() {
         for (b = 0; b < layer1_size; b++)
             syn1[a * layer1_size + b] = 0;
   }
-
-  if (negative>0) {
+  //Negative Sampling 模型
+  if (negative > 0) {
     a = posix_memalign((void **)&syn1neg, 128, (long long)vocab_size * layer1_size * sizeof(real));
     if (syn1neg == NULL) {printf("Memory allocation failed\n"); exit(1);}
     for (a = 0; a < vocab_size; a++)
         for (b = 0; b < layer1_size; b++)
             syn1neg[a * layer1_size + b] = 0;
   }
-
+  //随机初始化，没怎么看懂
   for (a = 0; a < vocab_size; a++)
       for (b = 0; b < layer1_size; b++) {
         next_random = next_random * (unsigned long long)25214903917 + 11;
@@ -384,16 +417,35 @@ void InitNet() {
 }
 
 void *TrainModelThread(void *id) {
+   // word 向sen中添加单词用，句子完成后表示句子中的当前单词
+  // last_word 上一个单词，辅助扫描窗口
+  // sentence_length 当前句子的长度（单词数）
+  // sentence_position 当前单词在当前句子中的index
   long long a, b, d, cw, word, last_word, sentence_length = 0, sentence_position = 0;
+  // word_count 已训练语料总长度
+  // last_word_count 保存值，以便在新训练语料长度超过某个值时输出信息
+  // sen 单词数组，表示句子
   long long word_count = 0, last_word_count = 0, sen[MAX_SENTENCE_LENGTH + 1];
+  // l1 ns中表示word在concatenated word vectors中的起始位置，之后layer1_size是对应的word vector，因为把矩阵拉成长向量了
+  // l2 cbow或ns中权重向量的起始位置，之后layer1_size是对应的syn1或syn1neg，因为把矩阵拉成长向量了
+  // c 循环中的计数作用
+  // target ns中当前的sample
+  // label ns中当前sample的label
   long long l1, l2, c, target, label, local_iter = iter;
+  // id 线程创建的时候传入，辅助随机数生成
   unsigned long long next_random = (long long)id;
+   // f e^x / (1/e^x)，fs中指当前编码为是0（父亲的左子节点为0，右为1）的概率，ns中指label是1的概率
+  // g 误差(f与真实值的偏离)与学习速率的乘积
   real f, g;
+  // 当前时间，和start比较计算算法效率
   clock_t now;
-  real *neu1 = (real *)calloc(layer1_size, sizeof(real));
-  real *neu1e = (real *)calloc(layer1_size, sizeof(real));
+
+  real *neu1 = (real *)calloc(layer1_size, sizeof(real)); // 隐层节点
+  real *neu1e = (real *)calloc(layer1_size, sizeof(real)); // 误差累计项，其实对应的是Gneu1
   FILE *fi = fopen(train_file, "rb");
+  //基于字节来切分训练语料
   fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
+
   while (1) {
     if (word_count - last_word_count > 10000) {
       word_count_actual += word_count - last_word_count;
@@ -405,17 +457,21 @@ void *TrainModelThread(void *id) {
          word_count_actual / ((real)(now - start + 1) / (real)CLOCKS_PER_SEC * 1000));
         fflush(stdout);
       }
-      alpha = starting_alpha * (1 - word_count_actual / (real)(iter * train_words + 1));
-      if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001;
+      alpha = starting_alpha * (1 - word_count_actual / (real)(iter * train_words + 1)); // 自动调整学习速率
+      if (alpha < starting_alpha * 0.0001) alpha = starting_alpha * 0.0001; //学习速率下限
     }
+    //当前句子长度为0
     if (sentence_length == 0) {
       while (1) {
         word = ReadWordIndex(fi);
-        if (feof(fi)) break;
-        if (word == -1) continue;
+        if (feof(fi)) break;  //文件结尾
+        if (word == -1) continue; //单词不存在
         word_count++;
-        if (word == 0) break;
+        if (word == 0) break; //是特殊词</s>
         // The subsampling randomly discards frequent words while keeping the ranking same
+        // 这里的亚采样是指 Sub-Sampling，Mikolov 在论文指出这种亚采样能够带来 2 到 10 倍的性能提升，并能够提升低频词的表示精度。
+        // 低频词被丢弃概率低，高频词被丢弃概率高
+        //具体参考博文http://blog.csdn.net/itplus/article/details/37998797
         if (sample > 0) {
           real ran = (sqrt(vocab[word].cn / (sample * train_words)) + 1) * (sample * train_words) / vocab[word].cn;
           next_random = next_random * (unsigned long long)25214903917 + 11;
@@ -425,8 +481,10 @@ void *TrainModelThread(void *id) {
         sentence_length++;
         if (sentence_length >= MAX_SENTENCE_LENGTH) break;
       }
-      sentence_position = 0;
+      sentence_position = 0;  // 当前单词在当前句中的index，起始值为0
     }
+
+    //读到文件末尾
     if (feof(fi) || (word_count > train_words / num_threads)) {
       word_count_actual += word_count - last_word_count;
       local_iter--;
@@ -437,14 +495,17 @@ void *TrainModelThread(void *id) {
       fseek(fi, file_size / (long long)num_threads * (long long)id, SEEK_SET);
       continue;
     }
+
     word = sen[sentence_position];
     if (word == -1) continue;
     for (c = 0; c < layer1_size; c++) neu1[c] = 0;
     for (c = 0; c < layer1_size; c++) neu1e[c] = 0;
     next_random = next_random * (unsigned long long)25214903917 + 11;
-    b = next_random % window;
+    b = next_random % window; //随机取窗口
+
     if (cbow) {  //train the cbow architecture
       // in -> hidden
+      //输入层到隐藏层
       cw = 0;
       for (a = b; a < window * 2 + 1 - b; a++) if (a != window) {
         c = sentence_position - window + a;
@@ -452,54 +513,74 @@ void *TrainModelThread(void *id) {
         if (c >= sentence_length) continue;
         last_word = sen[c];
         if (last_word == -1) continue;
+        //cbow 将上下文词的vector 相加
         for (c = 0; c < layer1_size; c++) neu1[c] += syn0[c + last_word * layer1_size];
         cw++;
       }
+
       if (cw) {
+        //归一化，上下文词的个数
         for (c = 0; c < layer1_size; c++) neu1[c] /= cw;
-        if (hs) for (d = 0; d < vocab[word].codelen; d++) {
-          f = 0;
-          l2 = vocab[word].point[d] * layer1_size;
-          // Propagate hidden -> output
-          for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1[c + l2];
-          if (f <= -MAX_EXP) continue;
-          else if (f >= MAX_EXP) continue;
-          else f = expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
-          // 'g' is the gradient multiplied by the learning rate
-          g = (1 - vocab[word].code[d] - f) * alpha;
-          // Propagate errors output -> hidden
-          for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
-          // Learn weights hidden -> output
-          for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * neu1[c];
+        //hierarchical softmax
+        //参考博文http://blog.csdn.net/itplus/article/details/37969519
+        if (hs){
+          for (d = 0; d < vocab[word].codelen; d++) {
+            f = 0;
+            l2 = vocab[word].point[d] * layer1_size;
+            // Propagate hidden -> output
+            for (c = 0; c < layer1_size; c++) 
+              f += neu1[c] * syn1[c + l2];
+            if (f <= -MAX_EXP) continue;
+            else if (f >= MAX_EXP) continue;
+            else f = expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
+            // 'g' is the gradient multiplied by the learning rate
+            // g 是梯度乘以学习速率
+            g = (1 - vocab[word].code[d] - f) * alpha;
+            // Propagate errors output -> hidden
+            // 累计误差率
+            for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
+            // Learn weights hidden -> output
+            // 更新参数权重值
+            for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * neu1[c];
+          }
         }
         // NEGATIVE SAMPLING
-        if (negative > 0) for (d = 0; d < negative + 1; d++) {
-          if (d == 0) {
-            target = word;
-            label = 1;
-          } else {
-            next_random = next_random * (unsigned long long)25214903917 + 11;
-            target = table[(next_random >> 16) % table_size];
-            if (target == 0) target = next_random % (vocab_size - 1) + 1;
-            if (target == word) continue;
-            label = 0;
+        // 负采样 算法
+        if (negative > 0) 
+        {
+          for (d = 0; d < negative + 1; d++) {
+            if (d == 0) {
+              target = word;
+              label = 1;
+            } else {
+              //进行随机采样
+              next_random = next_random * (unsigned long long)25214903917 + 11;
+              target = table[(next_random >> 16) % table_size];
+              if (target == 0) target = next_random % (vocab_size - 1) + 1;
+              if (target == word) continue;
+              label = 0;
+            }
+            l2 = target * layer1_size;
+            f = 0;
+            for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1neg[c + l2];
+            if (f > MAX_EXP) g = (label - 1) * alpha;
+            else if (f < -MAX_EXP) g = (label - 0) * alpha;
+            // 梯度 乘以 学习速率
+            else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
+            // 累计误差
+            for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
+            // 更新权值
+            for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * neu1[c];
           }
-          l2 = target * layer1_size;
-          f = 0;
-          for (c = 0; c < layer1_size; c++) f += neu1[c] * syn1neg[c + l2];
-          if (f > MAX_EXP) g = (label - 1) * alpha;
-          else if (f < -MAX_EXP) g = (label - 0) * alpha;
-          else g = (label - expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))]) * alpha;
-          for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1neg[c + l2];
-          for (c = 0; c < layer1_size; c++) syn1neg[c + l2] += g * neu1[c];
         }
-        // hidden -> in
+          // hidden -> in
         for (a = b; a < window * 2 + 1 - b; a++) if (a != window) {
           c = sentence_position - window + a;
           if (c < 0) continue;
           if (c >= sentence_length) continue;
           last_word = sen[c];
           if (last_word == -1) continue;
+          // 更新词向量
           for (c = 0; c < layer1_size; c++) syn0[c + last_word * layer1_size] += neu1e[c];
         }
       }
@@ -518,14 +599,19 @@ void *TrainModelThread(void *id) {
           l2 = vocab[word].point[d] * layer1_size;
           // Propagate hidden -> output
           for (c = 0; c < layer1_size; c++) f += syn0[c + l1] * syn1[c + l2];
+          // 不在expTable内的舍弃掉，有网友发邮件问过作者，作者回答说计算精度有限，怕有不好印象
+          // 可以改成太小的都是0，太大的都是1，运行结果还是有差别的
+          //参考注释 http://songchengru.eicp.net/code/word2vec.html
           if (f <= -MAX_EXP) continue;
           else if (f >= MAX_EXP) continue;
           else f = expTable[(int)((f + MAX_EXP) * (EXP_TABLE_SIZE / MAX_EXP / 2))];
           // 'g' is the gradient multiplied by the learning rate
           g = (1 - vocab[word].code[d] - f) * alpha;
           // Propagate errors output -> hidden
+          //记录累计误差
           for (c = 0; c < layer1_size; c++) neu1e[c] += g * syn1[c + l2];
           // Learn weights hidden -> output
+          // 
           for (c = 0; c < layer1_size; c++) syn1[c + l2] += g * syn0[c + l1];
         }
         // NEGATIVE SAMPLING
@@ -580,7 +666,7 @@ void TrainModel() {
   if (output_file[0] == 0) return;
   //
   InitNet();
-  //负采样
+  //对于负采样，带全采样初始化表
   if (negative > 0) InitUnigramTable();
   //
   start = clock();
